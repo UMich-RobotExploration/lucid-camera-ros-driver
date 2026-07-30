@@ -1,0 +1,17 @@
+# colcon workspace build artifacts
+build/
+install/
+log/
+
+# arena_api runtime cache (device stream-selector state, regenerated on demand)
+persist.json
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# editor/OS cruft
+.vscode/
+*.swp
+.DS_Store

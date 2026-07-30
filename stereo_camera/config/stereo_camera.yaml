@@ -1,0 +1,17 @@
+stereo_camera_node:
+  ros__parameters:
+    target_fps: 19.8
+    duration_sec: 10.0
+    exposure_us: 50429.312
+    output_dir: "."
+    action_device_key: 1
+    action_group_key: 1
+    action_group_mask: 1
+    schedule_delta: 0.05
+    buffer_timeout: 3000
+    lut_enable: true
+    lut_sigmoid_threshold: 0.005
+    lut_sigmoid_strength: 20.0
+    lut_sigmoid_dark_limit: 0
+    lut_sigmoid_bright_limit: 4095
+    sync_tolerance_us: 5000.0
