@@ -1,8 +1,9 @@
 stereo_camera_node:
   ros__parameters:
-    target_fps: 19.8
+    target_fps: 15.0
     duration_sec: 10.0
     exposure_us: 50429.312
+    gain_db: 12.0
     output_dir: "."
     action_device_key: 1
     action_group_key: 1
