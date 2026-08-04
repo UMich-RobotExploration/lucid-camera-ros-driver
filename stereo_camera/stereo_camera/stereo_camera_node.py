@@ -82,30 +82,50 @@ def _configure_ptp_role_and_wait(idx, device, is_master, stop_evt):
     stop_evt.wait(timeout=3.0)
 
 
-def _configure_camera(device, cfg):
+# Per-camera transmission-start offset so simultaneous PTP-synced cameras don't
+# burst onto the wire at the same instant — Lucid's bandwidth-sharing app note
+# formula: base_delay = packet_size * 1e9 / DeviceLinkSpeed(bytes/s), +25%
+# buffer. Confirmed empirically: this (via GevSCFTD alone, GevSCPD left at 0)
+# is what actually fixed the trigger-drop problem — see README.
+GEV_PACKET_SIZE = 1500
+
+
+def _configure_camera(device, cfg, idx):
     nm = device.nodemap
 
     nm['PixelFormat'].value = cfg['pixel_format']
 
-    # action command keys
-    nm['ActionUnconditionalMode'].value = 'On'
-    nm['ActionSelector'].value          = 0
-    nm['ActionDeviceKey'].value         = cfg['action_device_key']
-    nm['ActionGroupKey'].value          = cfg['action_group_key']
-    nm['ActionGroupMask'].value         = cfg['action_group_mask']
-
-    # trigger
-    nm['TriggerSelector'].value = 'FrameStart'
-    nm['TriggerMode'].value     = 'On'
-    nm['TriggerSource'].value   = 'Action0'
+    # No Action-command keys or TriggerMode/TriggerSource here — under
+    # AcquisitionStartMode=PTPSync the camera firmware generates its own
+    # trigger internally (armed via AcquisitionStart), and setting these
+    # legacy Action-Command nodes explicitly errors as "not writable" in
+    # this mode. This was confirmed by testing: those nodes were never
+    # touched in the standalone script that measured 100% delivery.
 
     # acquisition
-    nm['AcquisitionMode'].value            = 'Continuous'
-    nm['AcquisitionFrameRateEnable'].value = False
-    nm['ExposureAuto'].value               = 'Off'
-    nm['ExposureTime'].value               = cfg['exposure_us']
-    nm['GainAuto'].value                   = 'Off'
-    nm['Gain'].value                       = cfg['gain_db']
+    nm['AcquisitionMode'].value = 'Continuous'
+    nm['ExposureAuto'].value    = 'Off'
+    nm['ExposureTime'].value    = cfg['exposure_us']
+    nm['GainAuto'].value        = 'Off'
+    nm['Gain'].value            = cfg['gain_db']
+
+    # transmission-start stagger (see note above GEV_PACKET_SIZE)
+    link_speed_bps = nm['DeviceLinkSpeed'].value  # bytes/sec
+    base_delay_ns  = int(GEV_PACKET_SIZE * 1e9 / link_speed_bps * 1.25)
+    nm['GevSCPSPacketSize'].value = GEV_PACKET_SIZE
+    nm['GevSCPD'].value           = 0
+    nm['GevSCFTD'].value          = base_delay_ns * idx
+
+    # native PTP-synced acquisition — the camera firmware schedules its own
+    # periodic frame-start internally once armed via AcquisitionStart,
+    # instead of the host broadcasting a per-frame Action Command.
+    # AcquisitionFrameRateEnable becomes non-writable once this mode is set,
+    # so it must not be touched here.
+    nm['AcquisitionStartMode'].value = 'PTPSync'
+    max_fps = nm['AcquisitionFrameRate'].max
+    nm['AcquisitionFrameRate'].value = max_fps  # avoid capping PTPSyncFrameRate
+    nm['PTPSyncFrameRate'].value     = min(cfg['target_fps'], max_fps - 0.01)
+    nm['PTPSyncOffset'].value        = 0
 
     # LUT tone-mapping (brightening curve for low-light scenes; see README)
     nm['LUTFunction'].value              = 'LUTFunctionSigmoid'
@@ -117,38 +137,11 @@ def _configure_camera(device, cfg):
     nm['LUTEnable'].value                = cfg['lut_enable']
 
 
-def _fire_action_command(device, cfg):
-    nm = device.nodemap
-
-    ptp_status = nm['PtpStatus'].value
-
-    # latch and read master PTP clock
-    nm['PtpDataSetLatch'].execute()
-    curr_ptp   = nm['PtpDataSetLatchValue'].value
-    target_ptp = curr_ptp + int(cfg['schedule_delta'] * 1e9)
-
-    # set ALL three keys on the system nodemap — must match camera side
-    tl = system.tl_system_nodemap
-    tl['ActionCommandDeviceKey'].value   = cfg['action_device_key']
-    tl['ActionCommandGroupKey'].value    = cfg['action_group_key']
-    tl['ActionCommandGroupMask'].value   = cfg['action_group_mask']
-    tl['ActionCommandTargetIP'].value    = 0xFFFFFFFF  # broadcast
-    tl['ActionCommandExecuteTime'].value = target_ptp
-    tl['ActionCommandFireCommand'].execute()
-
-    return target_ptp, ptp_status
-
-
 # Measured empirically on the real hardware: a long device.get_buffer(timeout=...)
 # call adds tens of ms of latency even when a frame is already available —
 # whatever internal wait/poll granularity the SDK uses scales with the
 # requested timeout. Polling with a short timeout instead (and looping on
-# TimeoutError) drops per-call latency back to a few ms on both cameras. The
-# master additionally needs this to interleave trigger-firing on a single
-# thread: a long blocking get_buffer() in one thread starves a sibling
-# trigger-firing thread just as it starved the sibling process in the
-# original single-process, two-thread design (get_buffer() does not release
-# the GIL while blocked).
+# TimeoutError) drops per-call latency back to a few ms on both cameras.
 POLL_TIMEOUT_MS = 20
 
 
@@ -212,7 +205,11 @@ def _record_frame_timing(idx, cfg, stats, device, gb, dm, put_t):
     return stats
 
 
-def _slave_loop(idx, device, cfg, stop_evt, frame_queue):
+def _retrieval_loop(idx, device, cfg, stop_evt, frame_queue):
+    # Both cameras run the identical loop now — PTPSync mode means the camera
+    # firmware generates its own periodic frame-start internally (armed once
+    # via AcquisitionStart in _camera_worker_main), so there's no more
+    # host-driven trigger-firing to interleave with retrieval.
     stats = _new_worker_stats()
     pixel_format = cfg['pixel_format']
     last_frame_at = time.monotonic()
@@ -243,51 +240,6 @@ def _slave_loop(idx, device, cfg, stop_evt, frame_queue):
         stats = _record_frame_timing(idx, cfg, stats, device, t1 - t0, t2 - t1, t3 - t2)
 
 
-def _master_loop(idx, device, cfg, start_evt, stop_evt, frame_queue):
-    # Single-threaded on purpose (see the note above POLL_TIMEOUT_MS):
-    # interleave trigger-firing with a short-timeout get_buffer poll instead
-    # of a separate thread, since get_buffer() blocking here would starve a
-    # sibling thread just as badly as it starved the sibling *process* in the
-    # original single-process, two-thread design.
-    start_evt.wait()
-    period    = 1.0 / cfg['target_fps']
-    next_tick = time.monotonic()
-    tick      = 0
-    stats = _new_worker_stats()
-    pixel_format = cfg['pixel_format']
-
-    while not stop_evt.is_set():
-        if time.monotonic() >= next_tick:
-            next_tick += period
-            try:
-                target_ptp, ptp_status = _fire_action_command(device, cfg)
-                tick += 1
-                if tick % max(1, int(cfg['target_fps'])) == 0:
-                    print(f"[trigger] tick={tick} ptp_status={ptp_status} target={target_ptp} "
-                          f"delta={cfg['schedule_delta']}s", flush=True)
-            except Exception as e:
-                print(f"[trigger] error: {e}", flush=True)
-
-        try:
-            t0  = time.perf_counter()
-            buf = device.get_buffer(timeout=POLL_TIMEOUT_MS)
-            t1  = time.perf_counter()
-            ts  = buf.timestamp_ns
-            frame, is_color = _buffer_to_frame(buf, pixel_format)
-            t2  = time.perf_counter()
-            device.requeue_buffer(buf)
-        except TimeoutError:
-            continue  # nothing ready yet — loop back to re-check the trigger schedule
-        except Exception as e:
-            if not stop_evt.is_set():
-                print(f"[cam {idx}] capture error: {e}", flush=True)
-            continue
-
-        _enqueue_latest(frame_queue, (ts, frame, is_color))
-        t3 = time.perf_counter()
-        stats = _record_frame_timing(idx, cfg, stats, device, t1 - t0, t2 - t1, t3 - t2)
-
-
 def _camera_worker_main(idx, ip, is_master, cfg, ready_evt, start_evt, stop_evt, frame_queue):
     device = None
     try:
@@ -299,15 +251,16 @@ def _camera_worker_main(idx, ip, is_master, cfg, ready_evt, start_evt, stop_evt,
         _configure_ptp_role_and_wait(idx, device, is_master, stop_evt)
         if stop_evt.is_set():
             return
-        _configure_camera(device, cfg)
+        _configure_camera(device, cfg, idx)
         device.start_stream()
         ready_evt.set()
         print(f"[cam {idx}] stream started", flush=True)
 
-        if is_master:
-            _master_loop(idx, device, cfg, start_evt, stop_evt, frame_queue)
-        else:
-            _slave_loop(idx, device, cfg, stop_evt, frame_queue)
+        start_evt.wait()
+        device.nodemap['AcquisitionStart'].execute()
+        print(f"[cam {idx}] AcquisitionStart executed (PTPSync armed)", flush=True)
+
+        _retrieval_loop(idx, device, cfg, stop_evt, frame_queue)
     finally:
         if device is not None:
             try:
@@ -326,15 +279,11 @@ class stereo_camera_node(Node):
         super().__init__('stereo_camera_node')
 
         # parameters (see config/stereo_camera.yaml for the launch-time overrides)
-        self.declare_parameter('target_fps', 15.0)
+        self.declare_parameter('target_fps', 19.8)
         self.declare_parameter('duration_sec', 10.0)
-        self.declare_parameter('exposure_us', 50429.312)
-        self.declare_parameter('gain_db', 12.0)
+        self.declare_parameter('exposure_us', 30000.0)
+        self.declare_parameter('gain_db', 18.0)
         self.declare_parameter('output_dir', '.')
-        self.declare_parameter('action_device_key', 1)
-        self.declare_parameter('action_group_key', 1)
-        self.declare_parameter('action_group_mask', 1)
-        self.declare_parameter('schedule_delta', 0.05)
         self.declare_parameter('buffer_timeout', 3000)
         self.declare_parameter('lut_enable', True)
         self.declare_parameter('lut_sigmoid_threshold', 0.005)
@@ -348,10 +297,6 @@ class stereo_camera_node(Node):
         self.exposure_us       = self.get_parameter('exposure_us').value
         self.gain_db           = self.get_parameter('gain_db').value
         self.output_dir        = self.get_parameter('output_dir').value
-        self.action_device_key = self.get_parameter('action_device_key').value
-        self.action_group_key  = self.get_parameter('action_group_key').value
-        self.action_group_mask = self.get_parameter('action_group_mask').value
-        self.schedule_delta    = self.get_parameter('schedule_delta').value
         self.buffer_timeout    = self.get_parameter('buffer_timeout').value
         self.lut_enable               = self.get_parameter('lut_enable').value
         self.lut_sigmoid_threshold    = self.get_parameter('lut_sigmoid_threshold').value
@@ -379,9 +324,6 @@ class stereo_camera_node(Node):
 
         cfg = {
             'pixel_format':             'BayerRG8',
-            'action_device_key':        self.action_device_key,
-            'action_group_key':         self.action_group_key,
-            'action_group_mask':        self.action_group_mask,
             'exposure_us':              self.exposure_us,
             'gain_db':                  self.gain_db,
             'lut_enable':               self.lut_enable,
@@ -389,7 +331,6 @@ class stereo_camera_node(Node):
             'lut_sigmoid_strength':     self.lut_sigmoid_strength,
             'lut_sigmoid_dark_limit':   self.lut_sigmoid_dark_limit,
             'lut_sigmoid_bright_limit': self.lut_sigmoid_bright_limit,
-            'schedule_delta':           self.schedule_delta,
             'buffer_timeout':           self.buffer_timeout,
             'target_fps':               self.target_fps,
         }
@@ -397,14 +338,18 @@ class stereo_camera_node(Node):
         # Each camera's get_buffer()+demosaic loop runs in its own OS process
         # (not a thread) so the two cameras' blocking SDK calls run in true
         # parallel instead of serializing on the GIL — see README for the
-        # measured before/after. The master camera's worker also owns the
-        # PTP-scheduled Action Command trigger, since it's the only process
-        # holding a handle to the master's clock.
+        # measured before/after. Triggering itself is handled entirely by
+        # each camera's own firmware (AcquisitionStartMode=PTPSync, armed via
+        # start_evt below) — there's no host-driven per-frame trigger loop.
         ctx = mp.get_context('spawn')
         self._stop_event   = ctx.Event()
         self._start_event  = ctx.Event()
         self._ready_events = [ctx.Event(), ctx.Event()]
-        self._frame_queues = [ctx.Queue(maxsize=1), ctx.Queue(maxsize=1)]
+        # maxsize>1 (not the minimal 1) gives the parent's two reader threads
+        # slack to survive a brief GIL stall (e.g. one thread mid-publish)
+        # without a frame silently getting overwritten before it's read —
+        # see README for the periodic one-period pairing-drop this fixed.
+        self._frame_queues = [ctx.Queue(maxsize=4), ctx.Queue(maxsize=4)]
 
         self._workers = [
             ctx.Process(

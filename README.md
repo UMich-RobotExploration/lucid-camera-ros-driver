@@ -1,8 +1,9 @@
 # stereo_camera
 
 ROS2 (Jazzy) driver node for a Lucid Vision Labs TRIO054S-CC stereo pair. Uses PTP
-and scheduled Action Commands to hardware-synchronize the two cameras, then publishes
-each frame as `sensor_msgs/Image`.
+with native `AcquisitionStartMode=PTPSync` acquisition to hardware-synchronize the
+two cameras (each camera's own firmware generates its periodic frame-start
+internally, once armed), then publishes each frame as `sensor_msgs/Image`.
 
 Camera reference: https://support.thinklucid.com/triton-tri054s/
 
@@ -58,11 +59,10 @@ Parameters (`config/stereo_camera.yaml`, node name `stereo_camera_node`):
 
 | Parameter           | Default    | Meaning                                                  |
 |---------------------|-----------|-----------------------------------------------------------|
-| `target_fps`         | 15.0      | Capture/publish rate — see the throughput known-issue below for why this isn't higher |
-| `exposure_us`        | 50429.312 | Fixed exposure time (µs); must fit within `1/target_fps`   |
-| `schedule_delta`     | 0.05      | Seconds ahead (PTP time) to schedule the sync trigger       |
-| `buffer_timeout`     | 3000      | ms to wait for a frame buffer before erroring                |
-| `action_device_key`, `action_group_key`, `action_group_mask` | 1 | Must match on both cameras for the broadcast Action Command to fire |
+| `target_fps`         | 19.8      | Capture/publish rate — see the throughput section below for how this was reached |
+| `exposure_us`        | 30000.0   | Fixed exposure time (µs); must fit under the ceiling PTPSync enforces at `target_fps` |
+| `gain_db`            | 18.0      | Analog/digital gain (0-42dB); compensates brightness for the shorter exposure above |
+| `buffer_timeout`     | 3000      | ms of no frames before logging a stall warning |
 | `duration_sec`, `output_dir` | 10.0, "." | Reserved, not currently wired into node logic |
 | `lut_enable`                 | true | Enables the on-camera LUT tone-mapping curve |
 | `lut_sigmoid_threshold`      | 0.005 | Sigmoid midpoint, normalized 0–1 input. Lower = boosts darker signal |
@@ -73,69 +73,87 @@ Parameters (`config/stereo_camera.yaml`, node name `stereo_camera_node`):
 Edit `config/stereo_camera.yaml` and re-run (no rebuild needed — it's read at launch
 time), or override a single value live: `ros2 param set /stereo_camera_node exposure_us 40000`.
 
-**Known issue — throughput below `target_fps`:** at full 2880x1860 resolution this
-camera (TRI054S-CC) is rated 20.8 fps free-run, bandwidth-bound by its 1000BASE-T
-GigE interface (BayerRG8 at that resolution/rate is ~111 MB/s, near the line-rate
-ceiling). Getting close to that under *hardware-triggered, PTP-synced* capture (as
-opposed to free-run) turned out to require fixing three separate, independently
-measured problems, in order of how they were found:
+**Throughput history — how the node reached 19.8 fps synced:** at full 2880x1860
+resolution this camera (TRI054S-CC) is rated 20.8 fps free-run, bandwidth-bound by
+its 1000BASE-T GigE interface. Getting close to that under *hardware-synced* capture
+(not free-run) took several rounds of measurement — kept here because each fix
+addressed a real, independently-confirmed bottleneck, and the same failure modes
+could resurface if this architecture changes again:
 
-1. The original single-process, two-thread design (`_camera_retrieval_loop` on two
-   `threading.Thread`s) let the two cameras' blocking `device.get_buffer()` calls
-   serialize on the GIL — confirmed by isolating one camera in its own process
-   (clean 49ms/call, ~19.7 fps) versus both cameras together in the old two-thread
-   design (60-90ms/call, repeated ~100ms stalls, ~11-13 fps, despite zero GigE-level
-   packet loss the whole time). Fix: each camera's retrieval now runs in its own
-   `multiprocessing.Process`, not a thread, so the two `get_buffer()` calls run in
-   true OS-level parallel. The master camera's process also owns the PTP-scheduled
-   Action Command trigger, since it's the only process holding a handle that can
-   read the master's PTP clock.
-2. A long `get_buffer(timeout=...)` call adds real latency even when a frame is
-   already available — whatever internal wait granularity the SDK uses scales with
-   the requested timeout. Both camera loops now poll with a short timeout
-   (`POLL_TIMEOUT_MS = 20`) and loop on `TimeoutError` instead of blocking for the
-   full `buffer_timeout`; this alone dropped per-call latency from ~80-90ms back to
-   single-digit ms on both cameras. (For the master this also fixes a *second*
-   instance of the same GIL issue: a dedicated trigger-firing thread sharing a
-   process with a long-blocking `get_buffer()` call gets starved for the same
-   reason the two camera threads did in point 1 — so trigger-firing and retrieval
-   now interleave on a single thread via the short poll instead.)
-3. Even with (1) and (2) fixed, `target_fps: 19.8`/`19.7586` (the sensor's own
-   reported `AcquisitionFrameRate.max` at the configured `exposure_us`) left the
-   camera itself silently dropping close to half of all Action Command triggers —
-   confirmed by counting host-side trigger ticks fired (237 in 12s, i.e. full rate)
-   against frames actually delivered (129, ~54%). The externally-triggered exposure
-   window doesn't self-pace the way free-run does, so a trigger period this close to
-   the exposure time gets rejected by the camera whenever the previous frame's real
-   exposure+readout cycle hasn't finished. Backing off to `target_fps: 15.0` (period
-   ≈66.7ms vs. ≈50.4ms exposure) raised trigger success to ~98% in isolation; 17fps
-   only reached ~67%, so 15fps was kept as the safe, verified value rather than
-   bisecting further.
+1. **GIL contention across cameras.** The original single-process, two-thread design
+   let the two cameras' blocking `device.get_buffer()` calls serialize on the GIL —
+   confirmed by isolating one camera in its own process (clean 49ms/call, ~19.7 fps)
+   versus both cameras together in a two-thread design (60-90ms/call, ~11-13 fps,
+   despite zero GigE-level packet loss). Fix: each camera's retrieval runs in its own
+   `multiprocessing.Process`, not a thread.
+2. **`get_buffer()` timeout granularity.** A long `get_buffer(timeout=...)` call adds
+   real latency even when a frame is already available. Fix: poll with a short
+   timeout (`POLL_TIMEOUT_MS = 20`) and loop on `TimeoutError` instead — dropped
+   per-call latency from ~80-90ms back to single-digit ms on both cameras.
+3. **Trigger-period margin.** With those two fixed, an earlier design using PTP +
+   host-broadcast GenICam Action Commands (the host computing `target_ptp = now +
+   schedule_delta` on a fixed schedule and broadcasting a scheduled trigger) still
+   silently dropped close to half of all triggers at `target_fps≈19.76` — confirmed
+   by counting host-side ticks fired (237 in 12s, full rate) against frames actually
+   delivered (129, ~54%). Externally-scheduled Action Commands are open-loop: the
+   host pre-commits to a future execute time with no feedback on whether the camera's
+   real transfer has finished, so a period this close to the sensor's real cycle time
+   gets rejected on whichever cycles run longer than average. Ruled out as the fix:
+   `TriggerOverlap=PreviousFrame` (no effect — exposure wasn't the bottleneck) and
+   shortening `exposure_us` alone (no effect either — confirmed the ceiling was
+   transfer-time-bound, not exposure-bound). The working fix at the time was backing
+   off to `target_fps=15.0` for enough margin (~98% success) — see below for what
+   superseded this.
+4. **The actual fix: `AcquisitionStartMode=PTPSync` + `GevSCFTD` transmission-start
+   stagger.** Rather than the host broadcasting a trigger per frame, each camera's
+   own firmware generates its periodic frame-start internally (once armed via
+   `nm['AcquisitionStart'].execute()`), governed by `PTPSyncFrameRate`. This removes
+   the open-loop host-scheduling problem in point 3 entirely. Separately, `GevSCFTD`
+   (Stream Channel Frame Transmission Delay) staggers each camera's transmission
+   *start* instant by `packet_size * 1e9 / DeviceLinkSpeed * 1.25 * camera_index` ns
+   (Lucid's bandwidth-sharing app note formula) so the two PTP-synced cameras don't
+   burst onto the wire at the exact same moment — `GevSCPD` (continuous inter-packet
+   delay) was tested too but cut the achievable ceiling by more than half (bandwidth
+   directly traded for collision-avoidance margin) and turned out not to be needed;
+   `GevSCFTD` alone got the same reliability without that cost. Measured in isolation:
+   100% frame delivery, zero packet loss, tight sync (mean 8.6µs, max 18.2µs) at
+   ~19.7fps — up from the ~54% success rate in point 3 at the same target rate.
+   Two config values had to change to fit under PTPSync's constraints:
+   `exposure_us` dropped from 50429.312 to 30000.0 (the longer value exceeded the
+   max exposure PTPSync allows at `target_fps≈19.8`) with `gain_db` raised from 12
+   to 18 to compensate for brightness.
+5. **A secondary pairing-drop issue, in the real node only.** Integrating (4) into
+   the actual node initially showed periodic pairing drops (deltas of almost exactly
+   one full frame period, climbing over a test: 1→4→11→25→35) despite each camera
+   individually delivering ~19.6fps with zero GigE loss — meaning the sync/trigger
+   mechanism was solid but something was dropping frames on the host side. Cause: the
+   parent's two `_ipc_reader_loop` threads share one process (and GIL) with `Node`,
+   and each one's synchronous `cv_bridge`+`rclpy.publish()` call (~15-25ms) could
+   stall the *other* reader thread long enough that its worker's `maxsize=1` frame
+   queue silently overwrote a frame before it was ever read. Fix: raised
+   `frame_queue` `maxsize` from 1 to 4, giving enough slack to absorb a brief stall
+   without a drop. Confirmed: drops went from 35 in one test to 1 in the next
+   (~34s window, 665/666 frames paired).
 
-With all three fixed, measured sustained rate in the full node is **~12.3-12.5 fps**
-(some further overhead vs. the ~14.7 fps seen in an isolated synthetic test, likely
-IPC/ROS-publish cost nibbling at the trigger-timing margin) — a real, stable
-improvement over the original architecture's ~11-13 fps, but now clean: GigE
-counters stay at zero loss throughout, `get_buffer()` stays in the single-digit-ms
-range on both cameras, and hardware sync stays tight (single-digit-µs, same as
-before). `NewestOnly` buffering still means each camera's retrieval can drift onto
-different trigger cycles; `_try_publish_pair` only publishes when both timestamps
-land within `sync_tolerance_us` of each other (unpaired frames are dropped and
-logged, throttled to once per 5s). If you need higher throughput than 15fps, the
-next levers to try, in order: (a) lower `exposure_us` for more trigger-period
-margin if scene lighting allows, (b) publish raw `BayerRG8` instead of demosaiced
-`bgr8` to cut per-frame IPC/publish size and CPU ~3x — not yet implemented.
+With all of this, measured sustained rate in the full node is **~19.8 fps** — the
+originally-targeted rate — with 99.85%+ pairing success, zero GigE packet loss, and
+sync delta staying in the same single-digit-to-low-tens-of-µs range measured
+throughout this whole investigation. `NewestOnly` buffering at the GenTL layer and
+the larger host-side frame queue both still mean a frame can occasionally arrive
+out of pair; `_try_publish_pair` only publishes when both timestamps land within
+`sync_tolerance_us` of each other (unpaired frames are dropped and logged, throttled
+to once per 5s).
 
 **Known issue — dark images:** this camera has no raw "Gamma Point" enum — ArenaView's
 LUT Tone Mapping dropdown is a GUI abstraction over the `LUTFunctionSigmoid` feature.
-`_configure_camera` now generates a Sigmoid curve on every startup (params above) tuned
-against a scene where the raw pre-LUT signal measured mean=1.99/255, max=64/255 (with
-`LUTEnable` off) — i.e. genuinely underexposed at the sensor, not a display artifact.
-The Sigmoid curve is a cosmetic brightening of whatever signal exists; it cannot recover
-detail that isn't there. If images are still dark, the real fix is more Gain (the node
-doesn't currently set it — `Gain` sits at 0dB), more exposure (trades off `target_fps`),
-or more scene light. Re-tune `lut_sigmoid_threshold`/`lut_sigmoid_strength` if the actual
-signal level differs from the above.
+`_configure_camera` generates a Sigmoid curve on every startup (params above). The
+node now sets `Gain` explicitly (`gain_db`, default 18dB — see Configuration above);
+raw sensor mean measured ~71/255 at `exposure_us=30000`/`gain_db=18`, and the
+published (LUT-processed) image measured mean=67.7/255, full dynamic range — no
+longer underexposed. If images are still dark for your scene, increase `gain_db`
+(0-42dB range) or re-tune `lut_sigmoid_threshold`/`lut_sigmoid_strength`; raising
+`exposure_us` also helps but costs available `target_fps` margin (see Throughput
+history above).
 
 ## Running
 
@@ -148,18 +166,22 @@ ros2 run stereo_camera stereo_camera_node
 ros2 launch stereo_camera stereo_camera.launch.py
 ```
 
-On startup the node:
+On startup the node (each camera configured in its own OS process — see
+Throughput history above):
 1. Discovers exactly 2 connected devices (errors if not exactly 2).
 2. Configures the transport layer (`NewestOnly` buffering, auto packet size, resend).
 3. Enables PTP — camera 0 becomes Master, camera 1 Slave — and waits for convergence
    plus a 3s stabilization period.
-4. Configures pixel format, Action Command keys, and trigger/exposure settings.
-5. Starts both streams and a timer that fires a broadcast Action Command each cycle,
-   grabs both buffers, and publishes them.
+4. Configures pixel format, exposure/gain, `GevSCFTD` transmission-start stagger, and
+   `AcquisitionStartMode=PTPSync` with `PTPSyncFrameRate=target_fps`.
+5. Starts both streams, arms acquisition via `AcquisitionStart` (each camera's
+   firmware then generates its own periodic frame-start internally — no per-frame
+   host trigger), and each camera's process retrieves+demosaics its own buffers,
+   handing them to the parent process for pairing and publishing.
 
 Published topics:
-- `/camera/left/image_raw` (`sensor_msgs/Image`, `frame_id: left`)
-- `/camera/right/image_raw` (`sensor_msgs/Image`, `frame_id: right`)
+- `/camera/left/image_raw` (`sensor_msgs/Image`, encoding `bgr8`, `frame_id: left`)
+- `/camera/right/image_raw` (`sensor_msgs/Image`, encoding `bgr8`, `frame_id: right`)
 
 Frame timestamps come from each camera's PTP-synced hardware clock, not host wall
 time. A log line every ~1s of frames reports the inter-camera sync delta (typically
@@ -173,10 +195,9 @@ With the node running in one terminal:
 ros2 bag record -o stereo_run /camera/left/image_raw /camera/right/image_raw
 ```
 
-These are full-resolution uncompressed images at ~15 fps from two cameras, so bags
-grow fast (hundreds of MB/minute). For long recordings, consider recording the raw
-Bayer topic instead of the demosaiced BGR8 one, or use `image_transport`'s compressed
-plugin.
+These are full-resolution uncompressed `bgr8` images at ~19.8 fps from two cameras,
+so bags grow fast (hundreds of MB/minute). For long recordings, consider
+`image_transport`'s compressed plugin.
 
 ## Troubleshooting
 
