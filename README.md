@@ -183,6 +183,20 @@ Published topics:
 - `/camera/left/image_raw` (`sensor_msgs/Image`, encoding `bgr8`, `frame_id: left`)
 - `/camera/right/image_raw` (`sensor_msgs/Image`, encoding `bgr8`, `frame_id: right`)
 
+**Known issue — `ros2 topic hz` reads much lower than the real ~19.7fps rate** (e.g.
+~8-9Hz, with the max inter-arrival gap growing over time): at ~16MB/frame uncompressed,
+the default kernel UDP send-buffer size (`net.core.wmem_default`, often ~208KB on stock
+Ubuntu — check with `sysctl net.core.wmem_max net.core.wmem_default`) is far smaller than
+one frame's worth of fragments, so a burst of large messages backs up in the socket layer
+independent of anything this node does. This node's own internal counters (GigE
+delivered/lost, the `frame N` log line) are the source of truth for the real publish
+rate — they stayed clean at ~19.7fps in testing while `ros2 topic hz` degraded. Tried
+switching the publishers to best-effort QoS as a fix; that made it *worse* (whole frames
+silently dropped on any buffer overflow instead of being retried), so it was reverted —
+Reliable is the current, working configuration. The real fix is raising
+`net.core.wmem_max`/`wmem_default` to match `rmem_max` (standard ROS2/Fast-DDS tuning
+for large messages), not yet applied here.
+
 Frame timestamps come from each camera's PTP-synced hardware clock, not host wall
 time. A log line every ~1s of frames reports the inter-camera sync delta (typically
 single-digit microseconds once PTP has converged).

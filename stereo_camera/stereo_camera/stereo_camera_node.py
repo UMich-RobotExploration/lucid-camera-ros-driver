@@ -39,7 +39,11 @@ def _buffer_to_frame(buffer, pixel_format):
         # 3 bytes per pixel — color format
         if pixel_format == 'BayerRG8':
             frame    = raw.reshape(buffer.height, buffer.width).copy()
-            frame    = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
+            # OpenCV's Bayer naming is offset by one pixel from GenICam's:
+            # a GenICam/vendor "BayerRG8" pattern must be decoded with
+            # cv2.COLOR_BayerBG2BGR, not COLOR_BayerRG2BGR — the latter
+            # swaps the R/B sample positions and casts the image blue.
+            frame    = cv2.cvtColor(frame, cv2.COLOR_BayerBG2BGR)
             is_color = True
         else:
             # BGR8 or similar
@@ -50,7 +54,7 @@ def _buffer_to_frame(buffer, pixel_format):
         # 1 byte per pixel
         if 'Bayer' in str(pixel_format):
             frame    = raw.reshape(buffer.height, buffer.width).copy()
-            frame    = cv2.cvtColor(frame, cv2.COLOR_BayerRG2BGR)
+            frame    = cv2.cvtColor(frame, cv2.COLOR_BayerBG2BGR)
             is_color = True
         else:
             # Mono8
@@ -306,8 +310,8 @@ class stereo_camera_node(Node):
         self.sync_tolerance_us        = self.get_parameter('sync_tolerance_us').value
 
         # create a publisher for each cam
-        self.pub_left = self.create_publisher(Image, '/camera/left/image_raw',10)
-        self.pub_right = self.create_publisher(Image, '/camera/right/image_raw',10)
+        self.pub_left = self.create_publisher(Image, '/camera/left/image_raw', 10)
+        self.pub_right = self.create_publisher(Image, '/camera/right/image_raw', 10)
         self.bridge = CvBridge() #CvBridge is a ROS library that provides an interface between ROS and OpenCV
 
         self.frame_count = 0
