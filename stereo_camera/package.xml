@@ -13,6 +13,9 @@
   <depend>cv_bridge</depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ros2bag</exec_depend>
+  <exec_depend>ouster_ros</exec_depend>
+  <exec_depend>vectornav</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
