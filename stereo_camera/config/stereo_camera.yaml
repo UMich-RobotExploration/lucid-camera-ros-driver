@@ -2,8 +2,8 @@ stereo_camera_node:
   ros__parameters:
     target_fps: 19.7
     duration_sec: 10.0
-    exposure_us: 30000.0
-    gain_db: 18.0
+    exposure_us: 3000.0
+    gain_db: 26.0
     output_dir: "."
     buffer_timeout: 3000
     lut_enable: true

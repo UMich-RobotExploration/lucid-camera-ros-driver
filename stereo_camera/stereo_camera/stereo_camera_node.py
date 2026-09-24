@@ -193,7 +193,7 @@ def _record_frame_timing(idx, cfg, stats, device, gb, dm, put_t):
     stats['max_demosaic']   = max(stats['max_demosaic'], dm)
     stats['max_ipc_put']    = max(stats['max_ipc_put'], put_t)
 
-    if gb > 0.1 or dm > 0.1 or put_t > 0.1:
+    if gb > 0.05 or dm > 0.05 or put_t > 0.05:
         print(f"[cam {idx}][timing] stall: get_buffer={gb*1000:.1f}ms "
               f"demosaic={dm*1000:.1f}ms ipc_put={put_t*1000:.1f}ms", flush=True)
 
@@ -239,7 +239,7 @@ def _retrieval_loop(idx, device, cfg, stop_evt, frame_queue):
             continue
 
         last_frame_at = time.monotonic()
-        _enqueue_latest(frame_queue, (ts, frame, is_color))
+        _enqueue_latest(frame_queue, (ts, frame, is_color, last_frame_at))
         t3 = time.perf_counter()
         stats = _record_frame_timing(idx, cfg, stats, device, t1 - t0, t2 - t1, t3 - t2)
 
@@ -285,8 +285,8 @@ class stereo_camera_node(Node):
         # parameters (see config/stereo_camera.yaml for the launch-time overrides)
         self.declare_parameter('target_fps', 19.8)
         self.declare_parameter('duration_sec', 10.0)
-        self.declare_parameter('exposure_us', 30000.0)
-        self.declare_parameter('gain_db', 18.0)
+        self.declare_parameter('exposure_us', 3000.0)
+        self.declare_parameter('gain_db', 26.0)
         self.declare_parameter('output_dir', '.')
         self.declare_parameter('buffer_timeout', 3000)
         self.declare_parameter('lut_enable', True)
@@ -294,7 +294,7 @@ class stereo_camera_node(Node):
         self.declare_parameter('lut_sigmoid_strength', 20.0)
         self.declare_parameter('lut_sigmoid_dark_limit', 0)
         self.declare_parameter('lut_sigmoid_bright_limit', 4095)
-        self.declare_parameter('sync_tolerance_us', 5000.0)
+        self.declare_parameter('sync_tolerance_us', 5000.0) #pre viously 5000.0
 
         self.target_fps        = self.get_parameter('target_fps').value
         self.duration_sec      = self.get_parameter('duration_sec').value
@@ -388,11 +388,18 @@ class stereo_camera_node(Node):
         q = self._frame_queues[idx]
         while not self._stop_event.is_set():
             try:
-                ts, frame, is_color = q.get(timeout=1.0)
+                ts, frame, is_color, t_enq = q.get(timeout=1.0)
             except queue.Empty:
                 continue
             except (EOFError, OSError):
                 break
+            ipc_wait_ms = (time.monotonic() - t_enq) * 1000
+            if ipc_wait_ms > 20.0:
+                self.get_logger().warn(
+                    f"[cam {idx}] IPC dequeue stall: frame waited {ipc_wait_ms:.1f}ms "
+                    f"in queue before the reader thread picked it up",
+                    throttle_duration_sec=1.0,
+                )
             self._try_publish_pair(idx, ts, frame, is_color)
 
     def _record_publish_timing(self, dt):

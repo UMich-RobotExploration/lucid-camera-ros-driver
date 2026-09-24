@@ -139,7 +139,7 @@ def generate_launch_description():
     )
 
     ouster_ns = LaunchConfiguration('ouster_ns')
-
+    
     bag_record = ExecuteProcess( #recorded topics in the bag file
         cmd=[
             'ros2', 'bag', 'record',
@@ -147,12 +147,21 @@ def generate_launch_description():
             # the camera topics are raw, uncompressed bgr8 at ~20fps from two
             # cameras -- easily hundreds of MB/s uncompressed, so compress on
             # write or short recordings balloon into tens/hundreds of GB.
-            '--compression-mode', 'message',
+            '--compression-mode', 'message', #other mode is file, which compresses the entire bag file at once
             '--compression-format', 'zstd',
+            # default compression-queue-size is 1 -- with message-mode
+            # compression thFt means a single momentary stall in keeping up
+            # with two ~20fps uncompressed camera streams causes the next
+            # message to be dropped outright instead of just queued. Give it
+            # real headroom (system has 14 cores / 46GB RAM to spare) and
+            # make sure it's actually using multiple threads.
+            '--compression-queue-size', '150',
+            '--compression-threads', '8',
+
             '/camera/left/image_raw',
             '/camera/right/image_raw',
             ['/', ouster_ns, '/lidar_packets'],
-            ['/', ouster_ns, '/points'],
+           #['/', ouster_ns, '/points'],
             ['/', ouster_ns, '/imu_packets'],
             ['/', ouster_ns, '/metadata'],
             '/vectornav/imu',
