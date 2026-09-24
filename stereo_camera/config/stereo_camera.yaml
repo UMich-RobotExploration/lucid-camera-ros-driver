@@ -12,3 +12,12 @@ stereo_camera_node:
     lut_sigmoid_dark_limit: 0
     lut_sigmoid_bright_limit: 4095
     sync_tolerance_us: 5000.0
+    # Published as-is (no host-side demosaic): BayerRG8 -> sensor_msgs encoding bayer_rggb8
+    pixel_format: "BayerRG8"
+    # GenTL output-queue policy. OldestFirst keeps every frame the pool can hold and
+    # reports a real overflow in StreamLostFrameCount; NewestOnly (the old setting)
+    # silently overwrote frames whenever the host was late.
+    buffer_handling_mode: "OldestFirst"
+    stream_buffer_count: 20      # 20 x 5.4 MB per camera
+    publisher_history_depth: 40  # reliable KEEP_LAST depth; keep >= 2 x stream_buffer_count
+    report_period: 1.0           # seconds between [health] log lines

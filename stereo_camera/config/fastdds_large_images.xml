@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Fast DDS profile for the 5.4 MB raw Bayer images (2 cameras x 19.7 fps, two local
+subscribers: the recorder and rviz). The default shared-memory segment holds only a
+few 64 KB fragments of a message; when readers are slow to release them, fragments
+are dropped and repaired by the reliable protocol, which adds latency and loses
+whatever is mid-repair when the recorder stops. A 64 MB segment holds several whole
+images in flight. Point every ROS process at it (the launch files do this):
+
+    export FASTRTPS_DEFAULT_PROFILES_FILE=<share>/stereo_camera/config/fastdds_large_images.xml
+-->
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <profiles>
+    <transport_descriptors>
+      <transport_descriptor>
+        <transport_id>shm_large_images</transport_id>
+        <type>SHM</type>
+        <segment_size>67108864</segment_size>
+      </transport_descriptor>
+      <transport_descriptor>
+        <transport_id>udp_default</transport_id>
+        <type>UDPv4</type>
+      </transport_descriptor>
+    </transport_descriptors>
+    <participant profile_name="stereo_camera_large_images" is_default_profile="true">
+      <rtps>
+        <userTransports>
+          <transport_id>shm_large_images</transport_id>
+          <transport_id>udp_default</transport_id>
+        </userTransports>
+        <useBuiltinTransports>false</useBuiltinTransports>
+      </rtps>
+    </participant>
+  </profiles>
+</dds>

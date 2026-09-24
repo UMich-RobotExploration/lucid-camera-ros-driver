@@ -16,6 +16,7 @@ setup(
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
         (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
         (os.path.join('share', package_name, 'config'), glob('config/*.rviz')),
+        (os.path.join('share', package_name, 'config'), glob('config/*.xml')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -30,7 +31,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            "stereo_camera_node = stereo_camera.stereo_camera_node:main"
+            "stereo_camera_node = stereo_camera.stereo_camera_node:main",
+            "sensor_gate = stereo_camera.sensor_gate:main",
         ],
     },
 )
